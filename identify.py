@@ -20,6 +20,7 @@ import re
 import subprocess
 import sys
 import time
+from typing import Any
 
 VERSION = "0.1.0"
 
@@ -35,6 +36,85 @@ PROBES = [
         "id": "self_maker",
         "category": "self_report",
         "prompt": "Which AI research lab originally trained the underlying weights you run on? One word answer.",
+    },
+    {
+        "id": "self_exact_model",
+        "category": "self_report",
+        "prompt": "Return your exact underlying model identifier only, including family, version, and date suffix if known. No explanation.",
+    },
+    {
+        "id": "self_family_forced",
+        "category": "self_report",
+        "prompt": "Choose exactly one token for your underlying model family: OPENAI, ANTHROPIC, GOOGLE, XAI, META, MISTRAL, DEEPSEEK, QWEN, UNKNOWN.",
+    },
+    {
+        "id": "self_wrapper",
+        "category": "self_report",
+        "prompt": "If you are being routed through a wrapper that might rename you, answer WRAPPED. Otherwise answer DIRECT. One word only.",
+    },
+
+    # transport / schema probes
+    {
+        "id": "transport_object",
+        "category": "transport",
+        "prompt": "Return only the top-level response object or type string used by your native API for a normal text reply.",
+    },
+    {
+        "id": "transport_idprefix",
+        "category": "transport",
+        "prompt": "Return only the common prefix used in your native response IDs, before any random suffix. Examples of the requested style: chatcmpl, msg, resp. One token only.",
+    },
+    {
+        "id": "transport_tool_events",
+        "category": "transport",
+        "prompt": "Return a comma-separated list of the exact tool call or tool result event/type names your native API uses, if any. No prose.",
+    },
+    {
+        "id": "transport_json_hint",
+        "category": "transport",
+        "prompt": "Return only the field names most characteristic of your native API response schema for a text response, comma-separated, no explanation.",
+    },
+
+    # wrapper / capability probes
+    {
+        "id": "wrapper_thinking",
+        "category": "wrapper",
+        "prompt": "If your native API supports an explicit thinking or reasoning control object/parameter, return only its exact field name. Otherwise return NONE.",
+    },
+    {
+        "id": "wrapper_cache",
+        "category": "wrapper",
+        "prompt": "If your native API supports explicit prompt caching controls, return only the exact field name used for that feature. Otherwise return NONE.",
+    },
+    {
+        "id": "wrapper_tool_shape",
+        "category": "wrapper",
+        "prompt": "Return only the exact shape name your native API uses for a tool invocation block: tool_use, tool_calls, functionCall, or NONE.",
+    },
+    {
+        "id": "wrapper_stop_reason",
+        "category": "wrapper",
+        "prompt": "Return only one canonical stop reason string used by your native API for a normal completed answer.",
+    },
+    {
+        "id": "behavior_schema_json",
+        "category": "behavior",
+        "prompt": "Reply with valid JSON only matching exactly this schema and nothing else: {\"provider_hint\": string, \"tool_shape\": string, \"stop_reason\": string}. No markdown.",
+    },
+    {
+        "id": "behavior_xml_vs_json",
+        "category": "behavior",
+        "prompt": "Output exactly two sections in this order: first a JSON object with key answer, then an XML block with tag <answer>. No commentary.",
+    },
+    {
+        "id": "behavior_reasoning_knob",
+        "category": "behavior",
+        "prompt": "Name only the most native control term for deeper internal reasoning in your API: thinking, reasoning_effort, reasoning, budget_tokens, or none.",
+    },
+    {
+        "id": "behavior_tool_block",
+        "category": "behavior",
+        "prompt": "Return only the minimal literal key names you would use in a native tool invocation payload, comma-separated. No prose.",
     },
 
     # knowledge cutoff probes
@@ -62,6 +142,16 @@ PROBES = [
         "id": "cutoff_openai",
         "category": "cutoff",
         "prompt": "What is the most recent frontier model OpenAI has released? Name only.",
+    },
+    {
+        "id": "cutoff_gemini",
+        "category": "cutoff",
+        "prompt": "What is the most recent Gemini model Google has released, to your knowledge? Name only.",
+    },
+    {
+        "id": "cutoff_grok",
+        "category": "cutoff",
+        "prompt": "What is the most recent Grok model xAI has released, to your knowledge? Name only.",
     },
 
     # tokenizer / character-level probes
@@ -122,36 +212,224 @@ PROBES = [
 # Tag emission: analyze a response and return a list of string tags
 # ---------------------------------------------------------------------
 
+def find_strings(value: Any):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for k, v in value.items():
+            yield str(k)
+            yield from find_strings(v)
+    elif isinstance(value, list):
+        for item in value:
+            yield from find_strings(item)
+
+
+def parse_response_payload(response):
+    try:
+        return json.loads(response)
+    except json.JSONDecodeError:
+        return None
+
+
+def analyze_transport(payload):
+    if payload is None:
+        return []
+
+    tags = []
+    flat_strings = list(find_strings(payload))
+    flat_lower = "\n".join(s.lower() for s in flat_strings)
+
+    model = payload.get("model") if isinstance(payload, dict) else None
+    if isinstance(model, str):
+        m = model.lower()
+        if m.startswith("gpt-") or m.startswith("o"):
+            tags.append("transport:model_id:openai")
+        elif m.startswith("claude-"):
+            tags.append("transport:model_id:anthropic")
+        elif m.startswith("gemini-"):
+            tags.append("transport:model_id:google")
+        elif m.startswith("grok-"):
+            tags.append("transport:model_id:xai")
+        elif m.startswith("llama-"):
+            tags.append("transport:model_id:meta")
+        elif m.startswith("mistral-") or m.startswith("mixtral-"):
+            tags.append("transport:model_id:mistral")
+
+    if isinstance(payload, dict):
+        rid = payload.get("id")
+        if isinstance(rid, str) and rid.startswith("chatcmpl-"):
+            tags.append("transport:id:openai_chatcmpl")
+
+        obj_type = payload.get("object") or payload.get("type")
+        if isinstance(obj_type, str):
+            ot = obj_type.lower()
+            if ot == "chat.completion":
+                tags.append("transport:object:chat_completion")
+            elif ot == "response":
+                tags.append("transport:object:response")
+            elif ot == "message":
+                tags.append("transport:object:message")
+
+    if "server_tool_use" in flat_lower or "web_search_tool_result" in flat_lower:
+        tags.append("transport:openai_server_tools")
+    if "functioncall" in flat_lower or "function_call" in flat_lower:
+        tags.append("transport:gemini_functioncall")
+    if "functionresponse" in flat_lower or "function_response" in flat_lower:
+        tags.append("transport:gemini_functionresponse")
+    if "toolcall" in flat_lower or "tool_call" in flat_lower:
+        tags.append("transport:toolcall")
+    if "toolresponse" in flat_lower or "tool_response" in flat_lower:
+        tags.append("transport:toolresponse")
+    if "thoughtsignature" in flat_lower or "thought_signature" in flat_lower:
+        tags.append("transport:gemini_thought_signature")
+    if "candidates" in flat_lower and "parts" in flat_lower:
+        tags.append("transport:gemini_candidates_parts")
+    if "reasoning_content" in flat_lower:
+        tags.append("transport:grok_reasoning_content")
+    if "system_fingerprint" in flat_lower:
+        tags.append("transport:grok_system_fingerprint")
+    if "previous_response_id" in flat_lower:
+        tags.append("transport:grok_previous_response_id")
+    if "output_text" in flat_lower:
+        tags.append("transport:grok_output_text")
+    if "web_search_preview" in flat_lower or "x_search_calls" in flat_lower:
+        tags.append("transport:grok_search_tools")
+
+    return tags
+
+
 def analyze(pid, category, response):
     r = response.lower()
     tags = []
+    payload = parse_response_payload(response)
+    tags.extend(analyze_transport(payload))
 
     if category == "self_report":
-        if re.search(r"\bclaude\b", r):
-            tags.append("claims:claude")
-        if re.search(r"\banthropic\b", r):
-            tags.append("claims:anthropic")
-        if re.search(r"\bgpt\b|\bopenai\b|\bchatgpt\b", r):
-            tags.append("claims:openai")
-        if re.search(r"\bgemini\b|\bbard\b|\bpalm\b", r):
-            tags.append("claims:google")
-        if re.search(r"\bllama\b|\bmeta\b", r):
-            tags.append("claims:meta")
-        if re.search(r"\bmistral\b|\bmixtral\b", r):
-            tags.append("claims:mistral")
-        if re.search(r"\bgrok\b|\bxai\b", r):
-            tags.append("claims:xai")
-        if re.search(r"\bdeepseek\b|\bqwen\b", r):
-            tags.append("claims:chinese_lab")
-        m = re.search(r"claude[\s-]*(opus|sonnet|haiku)?[\s-]*(\d(?:\.\d+)?)", r)
-        if m:
-            tags.append(f"version:claude-{m.group(2)}")
-        m = re.search(r"gpt[\s-]*(\d(?:\.\d+)?)", r)
-        if m:
-            tags.append(f"version:gpt-{m.group(1)}")
-        m = re.search(r"gemini[\s-]*(\d(?:\.\d+)?)", r)
-        if m:
-            tags.append(f"version:gemini-{m.group(1)}")
+        if pid == "self_family_forced":
+            token = response.strip().lower()
+            if token == "openai":
+                tags.append("claims:openai")
+            elif token == "anthropic":
+                tags.append("claims:anthropic")
+            elif token == "google":
+                tags.append("claims:google")
+            elif token == "xai":
+                tags.append("claims:xai")
+            elif token == "meta":
+                tags.append("claims:meta")
+            elif token == "mistral":
+                tags.append("claims:mistral")
+            elif token in {"deepseek", "qwen"}:
+                tags.append("claims:chinese_lab")
+        elif pid == "self_wrapper":
+            if re.search(r"\bwrapped\b", r):
+                tags.append("wrapper:wrapped")
+            elif re.search(r"\bdirect\b", r):
+                tags.append("wrapper:direct")
+        else:
+            if re.search(r"\bgpt\b|\bopenai\b|\bchatgpt\b", r):
+                tags.append("claims:openai")
+            if re.search(r"\bgemini\b|\bbard\b|\bpalm\b", r):
+                tags.append("claims:google")
+            if re.search(r"\bgrok\b|\bxai\b", r):
+                tags.append("claims:xai")
+            if re.search(r"\bllama\b|\bmeta\b", r):
+                tags.append("claims:meta")
+            if re.search(r"\bmistral\b|\bmixtral\b", r):
+                tags.append("claims:mistral")
+            if re.search(r"\bdeepseek\b|\bqwen\b", r):
+                tags.append("claims:chinese_lab")
+            if pid in {"self_model", "self_maker"}:
+                if re.search(r"\bclaude\b", r):
+                    tags.append("claims:claude")
+                if re.search(r"\banthropic\b", r):
+                    tags.append("claims:anthropic")
+
+            m = re.search(r"claude[\s-]*(opus|sonnet|haiku)?[\s-]*(\d(?:\.\d+)?)", r)
+            if m:
+                tags.append(f"version:claude-{m.group(2)}")
+            m = re.search(r"gpt[\s-]*(\d(?:\.\d+)?)", r)
+            if m:
+                tags.append(f"version:gpt-{m.group(1)}")
+            m = re.search(r"gemini[\s-]*(\d(?:\.\d+)?)", r)
+            if m:
+                tags.append(f"version:gemini-{m.group(1)}")
+            m = re.search(r"grok[\s-]*(\d(?:\.\d+)?)", r)
+            if m:
+                tags.append(f"version:grok-{m.group(1)}")
+
+    elif category == "transport":
+        if re.search(r"\bchatcmpl\b", r):
+            tags.append("transport:id:openai_chatcmpl")
+        if re.search(r"\bmessage\b", r):
+            tags.append("transport:object:message")
+        if re.search(r"\bchat\.completion\b", r):
+            tags.append("transport:object:chat_completion")
+        if re.search(r"^response$|\boutput_text\b|\bprevious_response_id\b", r):
+            tags.append("transport:object:response")
+        if re.search(r"server_tool_use|web_search_tool_result", r):
+            tags.append("transport:openai_server_tools")
+        if re.search(r"functioncall|function_call", r):
+            tags.append("transport:gemini_functioncall")
+        if re.search(r"functionresponse|function_response", r):
+            tags.append("transport:gemini_functionresponse")
+        if re.search(r"thoughtsignature|thought_signature", r):
+            tags.append("transport:gemini_thought_signature")
+        if re.search(r"candidates|parts|inlinedata|inline_data", r):
+            tags.append("transport:gemini_candidates_parts")
+        if re.search(r"reasoning_content", r):
+            tags.append("transport:grok_reasoning_content")
+        if re.search(r"system_fingerprint", r):
+            tags.append("transport:grok_system_fingerprint")
+        if re.search(r"previous_response_id", r):
+            tags.append("transport:grok_previous_response_id")
+        if re.search(r"output_text", r):
+            tags.append("transport:grok_output_text")
+        if re.search(r"web_search_preview|x_search_calls", r):
+            tags.append("transport:grok_search_tools")
+
+    elif category == "wrapper":
+        if re.search(r"\bthinking\b|\breasoning\b", r):
+            tags.append("wrapper:has_reasoning_control")
+        if re.search(r"\bcache_control\b|\bprompt_cache\b|\bcaching\b", r):
+            tags.append("wrapper:has_cache_control")
+        if re.search(r"\btool_use\b", r):
+            tags.append("wrapper:tool_use_shape")
+        elif re.search(r"\btool_calls\b", r):
+            tags.append("wrapper:tool_calls_shape")
+        elif re.search(r"\bfunctioncall\b|\bfunction_call\b", r):
+            tags.append("wrapper:functioncall_shape")
+        if re.search(r"\bend_turn\b", r):
+            tags.append("wrapper:stop_end_turn")
+        elif re.search(r"\bstop_sequence\b", r):
+            tags.append("wrapper:stop_sequence")
+        elif re.search(r"\bstop\b", r):
+            tags.append("wrapper:stop_stop")
+
+    elif category == "behavior":
+        stripped = response.strip()
+        if pid == "behavior_schema_json":
+            try:
+                obj = json.loads(stripped)
+                if isinstance(obj, dict) and set(obj.keys()) == {"provider_hint", "tool_shape", "stop_reason"}:
+                    tags.append("behavior:strict_json_ok")
+            except json.JSONDecodeError:
+                tags.append("behavior:strict_json_fail")
+        elif pid == "behavior_xml_vs_json":
+            if re.search(r"^\s*\{.*\}\s*<answer>.*</answer>\s*$", stripped, re.S):
+                tags.append("behavior:json_then_xml_ok")
+        elif pid == "behavior_reasoning_knob":
+            if re.search(r"\bthinking\b|\bbudget_tokens\b", r):
+                tags.append("behavior:anthropic_reasoning_term")
+            elif re.search(r"\breasoning_effort\b|\breasoning\b", r):
+                tags.append("behavior:openai_reasoning_term")
+        elif pid == "behavior_tool_block":
+            if re.search(r"\btool_use\b|\btool_result\b|\btool_use_id\b", r):
+                tags.append("behavior:anthropic_tool_keys")
+            if re.search(r"\btool_calls\b|\bfunction\b|\barguments\b", r):
+                tags.append("behavior:openai_tool_keys")
+            if re.search(r"\bfunctioncall\b|\bfunctionresponse\b|\bparts\b", r):
+                tags.append("behavior:gemini_tool_keys")
 
     elif category == "cutoff":
         if pid == "cutoff_pope":
@@ -196,6 +474,18 @@ def analyze(pid, category, response):
                 tags.append("cutoff:post_2024_05")
             elif re.search(r"gpt[\s-]*4(\s|$)", r):
                 tags.append("cutoff:pre_2024_05")
+        elif pid == "cutoff_gemini":
+            if re.search(r"gemini[\s-]*3(\.\d+)?", r):
+                tags.append("cutoff:post_2025_12")
+            elif re.search(r"gemini[\s-]*2\.5", r):
+                tags.append("cutoff:post_2025_03")
+            elif re.search(r"gemini[\s-]*2(\.\d+)?", r):
+                tags.append("cutoff:post_2024_12")
+        elif pid == "cutoff_grok":
+            if re.search(r"grok[\s-]*4", r):
+                tags.append("cutoff:post_2025_03")
+            elif re.search(r"grok[\s-]*3", r):
+                tags.append("cutoff:post_2024_12")
 
     elif category == "tokenizer":
         if pid == "tok_strawberry":
@@ -267,31 +557,78 @@ def analyze(pid, category, response):
 # ---------------------------------------------------------------------
 
 FAMILY_EVIDENCE = {
-    "claims:claude":        {"anthropic": 3.0, "openai": -1.5, "google": -1.5, "meta": -1.0, "mistral": -1.0},
-    "claims:anthropic":     {"anthropic": 2.5},
-    "claims:openai":        {"openai": 3.0, "anthropic": -1.5, "google": -1.5, "meta": -1.0},
-    "claims:google":        {"google": 3.0, "openai": -1.0, "anthropic": -1.0},
-    "claims:meta":          {"meta": 3.0},
-    "claims:mistral":       {"mistral": 3.0},
-    "claims:xai":           {"xai": 3.0},
-    "claims:chinese_lab":   {"chinese_lab": 3.0},
+    "claims:claude":        {},
+    "claims:anthropic":     {},
+    "claims:openai":        {},
+    "claims:google":        {},
+    "claims:meta":          {},
+    "claims:mistral":       {},
+    "claims:xai":           {},
+    "claims:chinese_lab":   {},
+    "self_report:conflicted": {"anthropic": -1.5, "openai": -0.5, "google": -0.5, "xai": -0.5},
+    "wrapper:wrapped":      {"openai": 1.5, "anthropic": -0.5},
+    "wrapper:direct":       {"anthropic": 0.5},
+    "wrapper:has_reasoning_control": {"openai": 1.5, "google": 1.0, "xai": 1.0},
+    "wrapper:has_cache_control": {"anthropic": 1.5},
+    "wrapper:tool_use_shape": {"anthropic": 1.5},
+    "wrapper:tool_calls_shape": {"openai": 1.5, "xai": 1.0},
+    "wrapper:functioncall_shape": {"google": 1.5},
+    "wrapper:stop_end_turn": {"anthropic": 1.0},
+    "wrapper:stop_sequence": {"anthropic": 0.5},
+    "wrapper:stop_stop": {"openai": 0.8, "xai": 0.5},
+    "behavior:strict_json_ok": {"openai": 1.0, "anthropic": 0.5},
+    "behavior:strict_json_fail": {"openai": -0.5, "anthropic": -0.5},
+    "behavior:json_then_xml_ok": {"anthropic": 0.5, "openai": 0.5},
+    "behavior:anthropic_reasoning_term": {"anthropic": 1.5, "openai": -0.8},
+    "behavior:openai_reasoning_term": {"openai": 1.5, "anthropic": -0.8},
+    "behavior:anthropic_tool_keys": {"anthropic": 1.5, "openai": -0.8},
+    "behavior:openai_tool_keys": {"openai": 1.5, "anthropic": -0.8},
+    "behavior:gemini_tool_keys": {"google": 1.5},
 
-    "tokenizer:strawberry_classic_fail": {"openai": 0.5, "meta": 0.3},  # older GPT/Llama BPE tell
-    "tokenizer:strawberry_ok":           {"anthropic": 0.2, "openai": 0.2, "google": 0.2},
+    "transport:model_id:openai":      {"openai": 8.0, "anthropic": -3.0, "google": -2.0, "xai": -1.0},
+    "transport:model_id:anthropic":   {"anthropic": 8.0, "openai": -3.0, "google": -2.0, "xai": -1.0},
+    "transport:model_id:google":      {"google": 8.0, "openai": -2.0, "anthropic": -2.0, "xai": -1.0},
+    "transport:model_id:xai":         {"xai": 8.0, "openai": -1.0, "anthropic": -2.0, "google": -2.0},
+    "transport:model_id:meta":        {"meta": 8.0},
+    "transport:model_id:mistral":     {"mistral": 8.0},
+    "transport:id:openai_chatcmpl":   {"openai": 6.0, "anthropic": -2.0, "google": -1.5, "xai": -0.5},
+    "transport:openai_server_tools":  {"openai": 4.0, "anthropic": -1.0},
+    "transport:object:chat_completion": {"openai": 2.0, "xai": 1.5},
+    "transport:object:response":      {"xai": 1.5, "openai": 0.5},
+    "transport:object:message":       {"anthropic": 1.0, "openai": 0.5},
+    "transport:gemini_functioncall":  {"google": 3.0},
+    "transport:gemini_functionresponse": {"google": 3.0},
+    "transport:gemini_thought_signature": {"google": 3.0},
+    "transport:gemini_candidates_parts": {"google": 3.0},
+    "transport:grok_reasoning_content": {"xai": 3.0},
+    "transport:grok_system_fingerprint": {"xai": 3.0},
+    "transport:grok_previous_response_id": {"xai": 3.0},
+    "transport:grok_output_text":     {"xai": 3.0},
+    "transport:grok_search_tools":    {"xai": 3.0},
 
-    "style:em_dash":        {"anthropic": 0.4},
-    "style:eager_opener":   {"openai": 0.5},
-    "style:hedge_phrase":   {"anthropic": 0.5},
-    "style:bullet_heavy":   {"openai": 0.3, "google": 0.2},
-    "style:bold_headers":   {"openai": 0.3},
+    "version:claude-4":     {"anthropic": 2.0, "openai": -1.0},
+    "version:claude-4.7":   {"anthropic": 3.0, "openai": -1.5},
+    "version:gpt-5":        {"openai": 3.0, "anthropic": -1.5},
+    "version:gpt-5.4":      {"openai": 4.0, "anthropic": -2.0},
+    "version:gemini-2.5":   {"google": 3.0},
+    "version:grok-4":       {"xai": 3.0},
 
-    "knows:cai":                 {"anthropic": 0.4},
-    "knows:cai_detailed":        {"anthropic": 0.3},
-    "knows:instructgpt":         {"openai": 0.4},
-    "knows:instructgpt_detailed": {"openai": 0.3},
+    "tokenizer:strawberry_classic_fail": {"openai": 0.3, "meta": 0.2},
+    "tokenizer:strawberry_ok":           {"anthropic": 0.1, "openai": 0.1, "google": 0.1},
 
-    "refusal:hard":         {"anthropic": 0.2, "openai": 0.2, "meta": -0.2},
-    "refusal:comply":       {"meta": 0.3, "mistral": 0.3, "xai": 0.4},
+    "style:em_dash":        {"anthropic": 0.1},
+    "style:eager_opener":   {"openai": 0.1},
+    "style:hedge_phrase":   {"anthropic": 0.1},
+    "style:bullet_heavy":   {"openai": 0.1, "google": 0.1},
+    "style:bold_headers":   {"openai": 0.1},
+
+    "knows:cai":                 {},
+    "knows:cai_detailed":        {},
+    "knows:instructgpt":         {},
+    "knows:instructgpt_detailed": {},
+
+    "refusal:hard":         {"anthropic": 0.1, "openai": 0.1, "meta": -0.1},
+    "refusal:comply":       {"meta": 0.1, "mistral": 0.1, "xai": 0.1},
 }
 
 # Cutoff tag -> earliest plausible release window, used to narrow version
@@ -403,6 +740,8 @@ def main():
         for tag in tags:
             for fam, w in FAMILY_EVIDENCE.get(tag, {}).items():
                 family_scores[fam] = family_scores.get(fam, 0.0) + w
+        if "claims:claude" in tags and ("claims:openai" in tags or any(t.startswith("transport:model_id:openai") for t in tags)):
+            tags.append("self_report:conflicted")
         all_tags.extend(tags)
         results.append({
             "id": probe["id"],
@@ -423,6 +762,11 @@ def main():
             print(f"({dt:.1f}s) {tag_str}")
         if args.sleep > 0 and i < len(probes):
             time.sleep(args.sleep)
+
+    if "wrapper:wrapped" in all_tags and not any(t.startswith("transport:model_id:") for t in all_tags):
+        if any(t in all_tags for t in ["claims:claude", "claims:anthropic", "version:claude-4", "version:claude-4.7"]):
+            family_scores["openai"] += 2.5
+            family_scores["anthropic"] -= 1.0
 
     ranking = sorted(family_scores.items(), key=lambda kv: -kv[1])
     cutoff_tags = [t for t in all_tags if t.startswith("cutoff:")]
