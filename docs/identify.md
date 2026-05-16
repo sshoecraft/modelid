@@ -83,7 +83,45 @@ picking the most-recent `cutoff:post_YYYY_MM` tag present.
 - External probe set: pass `--probes custom.json` with the same
   `[{id, category, prompt}, ...]` shape.
 
+## Open-weights detection (v0.2.0)
+
+Wrappers like Claude Code can route to *any* backend behind an
+Anthropic-API-compatible proxy. When the backend is an open-weights model
+(Gemma, Llama, Mistral, Qwen, ...) served via an OpenAI-compatible
+endpoint, several wrapper-induced signals (`wrapper:has_cache_control`,
+`behavior:anthropic_reasoning_term`, `transport:id_text:openai_chatcmpl`)
+falsely point at Anthropic/OpenAI because they describe the *wrapper*,
+not the *weights*.
+
+v0.2.0 adds:
+
+- **Open-weights probes:** `self_open_weights`, `self_architecture`,
+  expanded `self_family_forced` (now lists GEMMA, LLAMA, MISTRAL, QWEN,
+  DEEPSEEK, PHI as explicit options).
+- **Gemma shibboleths:** `shib_gemma` (asks about Gemma's hybrid
+  local-global attention — only models with cutoff ≥ April 2026 know
+  this), `shib_open_models`.
+- **Text-vs-payload disambiguation:** `transport:id:openai_chatcmpl` is
+  reserved for genuine JSON payload detection (high confidence). Text
+  self-reports are tagged `transport:id_text:openai_chatcmpl` with much
+  lower weight, because models served behind an OpenAI-compatible proxy
+  will happily *claim* `chatcmpl-` IDs regardless of their actual
+  underlying weights.
+- **Wrapper de-weighting heuristic:** When direct open-weights evidence
+  is present (`claims:gemma`, `version:gemma-*`, `version:llama-*`,
+  `open_weights:yes`, `knows:gemma_architecture`, or any open-family
+  claim), the script subtracts wrapper-induced Anthropic credit
+  (`wrapper:has_cache_control`, `wrapper:tool_use_shape`, etc.) and the
+  text-claimed-chatcmpl OpenAI credit. This handles the
+  "Claude-Code-over-open-weights-via-OpenAI-proxy" deployment pattern.
+- **Gemma / Llama version tags:** `version:gemma-2/3/4`,
+  `version:llama-3/4` score directly to google/meta.
+
 ## History
 
 - 0.1.0 — initial implementation: 7 categories, 16 probes, 7 families,
   cutoff-window estimation, passthrough-arg forwarding.
+- 0.2.0 — open-weights detection. Added 4 probes (37 total), Gemma/Llama
+  version tags, text-vs-payload transport disambiguation, and a wrapper
+  de-weighting heuristic for Claude-Code-style wrapping over
+  open-weights backends served via OpenAI-compatible endpoints.
