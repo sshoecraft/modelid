@@ -7,11 +7,12 @@ scores the responses to guess which model is behind the wall.
 Usage:
     python3 identify.py --path /path/to/claude [claude-flags...]
 
-Everything after the script's own flags is forwarded to the binary, so:
-    python3 identify.py --path claude --model claude-sonnet-4-6
-    python3 identify.py --path claude -- --verbose --model gpt-4o
+Flags (including the prompt flag) are passed via --extra-args or `--`:
+    python3 identify.py --path claude --extra-args -p
+    python3 identify.py --path shepherd --extra-args --prompt
+    python3 identify.py --path claude -- --model gpt-4o -p
 
-The binary is invoked as:  <path> <passthrough-args> -p "<probe>"
+The binary is invoked as:  <path> <extra-args> <passthrough-args> "<probe>"
 and its stdout is captured as the response.
 """
 import argparse
@@ -22,7 +23,7 @@ import sys
 import time
 from typing import Any
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 PROBES = [
     # self-report (weak signal through Claude Code due to system prompt,
@@ -381,6 +382,8 @@ def analyze(pid, category, response):
                 tags.append("claims:openai")
             if re.search(r"\bgemini\b|\bbard\b|\bpalm\b", r):
                 tags.append("claims:google_closed")
+            if re.search(r"\bgoogle\b|\bdeepmind\b", r):
+                tags.append("claims:google")
             if re.search(r"\bgemma\b", r):
                 tags.append("claims:gemma")
             if re.search(r"\bgrok\b|\bxai\b", r):
@@ -425,12 +428,26 @@ def analyze(pid, category, response):
         # underlying weights. Tag them under :text variants with lower weight.
         if re.search(r"\bchatcmpl\b", r):
             tags.append("transport:id_text:openai_chatcmpl")
+        if re.search(r"^resp(_|\b)", r):
+            tags.append("transport:id_text:openai_resp")
+        if re.search(r"\bmsg_", r) or re.fullmatch(r"msg", r):
+            tags.append("transport:id_text:anthropic_msg")
         if re.search(r"\bmessage\b", r):
             tags.append("transport:object_text:message")
         if re.search(r"\bchat\.completion\b", r):
             tags.append("transport:object_text:chat_completion")
         if re.search(r"^response$|\boutput_text\b|\bprevious_response_id\b", r):
             tags.append("transport:object_text:response")
+        if pid == "transport_json_hint":
+            if "choices" in r and ("usage" in r or "created" in r):
+                tags.append("transport:json:openai_chat_completions")
+            if re.search(r"\boutput\b", r) and "model" in r and re.search(r"\bresp", r) is None:
+                if "choices" not in r:
+                    tags.append("transport:json:openai_responses")
+            if "candidates" in r and "parts" in r:
+                tags.append("transport:json:gemini")
+            if "stop_reason" in r and "content" in r:
+                tags.append("transport:json:anthropic_messages")
         if re.search(r"server_tool_use|web_search_tool_result", r):
             tags.append("transport:openai_server_tools")
         if re.search(r"functioncall|function_call", r):
@@ -453,10 +470,14 @@ def analyze(pid, category, response):
             tags.append("transport:grok_search_tools")
 
     elif category == "wrapper":
-        if re.search(r"\bthinking\b|\breasoning\b", r):
-            tags.append("wrapper:has_reasoning_control")
-        if re.search(r"\bcache_control\b|\bprompt_cache\b|\bcaching\b", r):
-            tags.append("wrapper:has_cache_control")
+        if re.search(r"\bthinking\b|\bbudget_tokens\b", r):
+            tags.append("wrapper:anthropic_thinking")
+        elif re.search(r"\breasoning_effort\b|\breasoning\b", r):
+            tags.append("wrapper:openai_reasoning")
+        if re.search(r"\bcache_control\b", r):
+            tags.append("wrapper:anthropic_cache_control")
+        elif re.search(r"prompt_cache_key|prompt_cache", r):
+            tags.append("wrapper:openai_prompt_cache")
         if re.search(r"\btool_use\b", r):
             tags.append("wrapper:tool_use_shape")
         elif re.search(r"\btool_calls\b", r):
@@ -509,12 +530,15 @@ def analyze(pid, category, response):
             elif re.search(r"don'?t know|cannot|no information|haven'?t|unable|after my|beyond my", r):
                 tags.append("cutoff:pre_2024_11")
         elif pid == "cutoff_iphone":
-            m = re.search(r"iphone\s*(\d+)", r)
+            m = re.search(r"iphone\s*(\d+)(e?)", r)
             if m:
                 num = int(m.group(1))
-                tags.append(f"iphone_known:{num}")
+                suffix = m.group(2) or ""
+                tags.append(f"iphone_known:{num}{suffix}")
                 if num >= 17:
                     tags.append("cutoff:post_2025_09")
+                elif num == 16 and suffix == "e":
+                    tags.append("cutoff:post_2025_02")
                 elif num == 16:
                     tags.append("cutoff:post_2024_09")
                 elif num <= 15:
@@ -532,7 +556,15 @@ def analyze(pid, category, response):
             elif re.search(r"3\.5", r):
                 tags.append("cutoff:post_2024_04")
         elif pid == "cutoff_openai":
-            if re.search(r"gpt[\s-]*5|\bo3\b|\bo4\b", r):
+            if re.search(r"gpt[\s-]*5\.5", r):
+                tags.append("cutoff:post_2026_04")
+            elif re.search(r"gpt[\s-]*5\.2", r):
+                tags.append("cutoff:post_2026_01")
+            elif re.search(r"gpt[\s-]*5\.1", r):
+                tags.append("cutoff:post_2025_11")
+            elif re.search(r"gpt[\s-]*5", r):
+                tags.append("cutoff:post_2025_08")
+            elif re.search(r"\bo3\b|\bo4\b", r):
                 tags.append("cutoff:post_2024_12")
             elif re.search(r"gpt[\s-]*4\.?5|gpt[\s-]*4\.1|4o", r):
                 tags.append("cutoff:post_2024_05")
@@ -643,10 +675,10 @@ def analyze(pid, category, response):
 # ---------------------------------------------------------------------
 
 FAMILY_EVIDENCE = {
-    "claims:claude":        {},
-    "claims:anthropic":     {},
-    "claims:openai":        {},
-    "claims:google":        {},
+    "claims:claude":        {"anthropic": 1.5},
+    "claims:anthropic":     {"anthropic": 2.0},
+    "claims:openai":        {"openai": 2.0},
+    "claims:google":        {"google": 2.0},
     "claims:google_closed": {"google": 2.0},
     "claims:gemma":         {"google": 4.0, "anthropic": -1.0, "openai": -1.0},
     "claims:meta":          {"meta": 2.0},
@@ -661,8 +693,10 @@ FAMILY_EVIDENCE = {
                              "google": -0.3, "meta": -1.0, "mistral": -1.0, "chinese_lab": -0.3},
     "wrapper:wrapped":      {"openai": 1.5, "anthropic": -0.5},
     "wrapper:direct":       {"anthropic": 0.5},
-    "wrapper:has_reasoning_control": {"openai": 1.5, "google": 1.0, "xai": 1.0},
-    "wrapper:has_cache_control": {"anthropic": 1.5},
+    "wrapper:anthropic_thinking": {"anthropic": 1.5, "openai": -0.5},
+    "wrapper:openai_reasoning": {"openai": 1.5, "anthropic": -0.5},
+    "wrapper:anthropic_cache_control": {"anthropic": 2.0, "openai": -0.5},
+    "wrapper:openai_prompt_cache": {"openai": 2.0, "anthropic": -0.5},
     "wrapper:tool_use_shape": {"anthropic": 1.5},
     "wrapper:tool_calls_shape": {"openai": 1.5, "xai": 1.0},
     "wrapper:functioncall_shape": {"google": 1.5},
@@ -689,9 +723,15 @@ FAMILY_EVIDENCE = {
     # Text-claimed by the model (low confidence — could just be guessing from
     # the OpenAI-compatible serving layer it was deployed behind)
     "transport:id_text:openai_chatcmpl": {"openai": 1.0},
+    "transport:id_text:openai_resp":  {"openai": 2.0, "xai": -0.3, "anthropic": -0.5},
+    "transport:id_text:anthropic_msg": {"anthropic": 2.0, "openai": -0.5},
     "transport:object_text:chat_completion": {"openai": 0.5, "xai": 0.3},
-    "transport:object_text:response": {"xai": 0.3, "openai": 0.2},
-    "transport:object_text:message":  {"anthropic": 0.3, "openai": 0.2},
+    "transport:object_text:response": {"openai": 1.5, "xai": 0.3},
+    "transport:object_text:message":  {"anthropic": 1.0, "openai": 0.2},
+    "transport:json:openai_chat_completions": {"openai": 2.5, "xai": 0.5, "anthropic": -0.5},
+    "transport:json:openai_responses": {"openai": 2.5, "anthropic": -0.5},
+    "transport:json:anthropic_messages": {"anthropic": 3.0, "openai": -1.0},
+    "transport:json:gemini":          {"google": 3.0, "openai": -0.5},
     "transport:openai_server_tools":  {"openai": 4.0, "anthropic": -1.0},
     "transport:object:chat_completion": {"openai": 2.0, "xai": 1.5},
     "transport:object:response":      {"xai": 1.5, "openai": 0.5},
@@ -749,9 +789,15 @@ FAMILY_EVIDENCE = {
 # Cutoff tag -> earliest plausible release window, used to narrow version
 # guesses within a family.
 CUTOFF_WINDOWS = [
+    ("cutoff:post_2026_04", "2026-04"),
+    ("cutoff:post_2026_01", "2026-01"),
     ("cutoff:post_2025_12", "2025-12"),
+    ("cutoff:post_2025_11", "2025-11"),
     ("cutoff:post_2025_09", "2025-09"),
+    ("cutoff:post_2025_08", "2025-08"),
+    ("cutoff:post_2025_04", "2025-04"),
     ("cutoff:post_2025_03", "2025-03"),
+    ("cutoff:post_2025_02", "2025-02"),
     ("cutoff:post_2024_12", "2024-12"),
     ("cutoff:post_2024_11", "2024-11"),
     ("cutoff:post_2024_09", "2024-09"),
@@ -764,13 +810,22 @@ CUTOFF_WINDOWS = [
 ]
 
 
+def last_line(text):
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    return lines[-1] if lines else ""
+
+
 def call_binary(path, extra_args, prompt, timeout):
-    cmd = [path] + list(extra_args) + ["-p", prompt]
+    cmd = [path] + list(extra_args) + [prompt]
     try:
         result = subprocess.run(
             cmd, capture_output=True, text=True, timeout=timeout, check=False
         )
-        return result.stdout.strip(), result.returncode, result.stderr.strip()
+        stdout = last_line(result.stdout)
+        stderr = result.stderr.strip()
+        if not stdout and stderr:
+            return last_line(stderr), result.returncode, ""
+        return stdout, result.returncode, stderr
     except subprocess.TimeoutExpired:
         return "", -1, f"timeout after {timeout}s"
     except FileNotFoundError:
@@ -810,6 +865,10 @@ def main():
     ap.add_argument("--skip-cats", help="Comma-separated categories to skip")
     ap.add_argument("--sleep", type=float, default=0.0,
                     help="Seconds to sleep between probes (rate limiting)")
+    ap.add_argument("--extra-args", nargs="*", default=[],
+                    help="Additional arguments to pass to the binary before the prompt (e.g. -p, --prompt)")
+    ap.add_argument("--verbose", action="store_true",
+                    help="Show probe questions and answers")
 
     args, leftover = ap.parse_known_args(script_argv)
     passthrough = leftover + explicit_pass
@@ -839,9 +898,10 @@ def main():
 
     if show_progress:
         print(f"model-identifier v{VERSION}")
-        print(f"  binary:      {args.path}")
-        print(f"  passthrough: {' '.join(passthrough) if passthrough else '(none)'}")
-        print(f"  probes:      {len(probes)}")
+        print(f"  binary:        {args.path}")
+        print(f"  extra-args:    {' '.join(args.extra_args) if args.extra_args else '(none)'}")
+        print(f"  passthrough:   {' '.join(passthrough) if passthrough else '(none)'}")
+        print(f"  probes:        {len(probes)}")
         print()
 
     for i, probe in enumerate(probes, 1):
@@ -849,7 +909,7 @@ def main():
             label = f"[{i:2d}/{len(probes)}] {probe['id']:22s}"
             print(label, end=" ", flush=True)
         t0 = time.time()
-        resp, rc, err = call_binary(args.path, passthrough, probe["prompt"], args.timeout)
+        resp, rc, err = call_binary(args.path, args.extra_args + passthrough, probe["prompt"], args.timeout)
         dt = time.time() - t0
         tags = analyze(probe["id"], probe["category"], resp)
         for tag in tags:
@@ -875,6 +935,9 @@ def main():
                 print(f"\nAborting: {err}", file=sys.stderr)
                 sys.exit(3)
             print(f"({dt:.1f}s) {tag_str}")
+            if args.verbose:
+                print(f"  Q: {probe['prompt']}")
+                print(f"  A: {resp}")
         if args.sleep > 0 and i < len(probes):
             time.sleep(args.sleep)
 
